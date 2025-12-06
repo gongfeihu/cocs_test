@@ -1,0 +1,125 @@
+#include "fastcdc.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+// USE_CHUNKING_METHOD
+#define USE_CHUNKING_METHOD 1
+#define STEP 32
+#define MAX_CACHE_SIZE (100 * 1024 * 1024)  // 限制为100MB而不是1GB
+
+// 创建目录的辅助函数
+int create_directory_if_not_exists(const char *dir) {
+    struct stat st = {0};
+    if (stat(dir, &st) == -1) {
+        #ifdef _WIN32
+            return mkdir(dir);
+        #else
+            return mkdir(dir, 0755);  // 创建目录，设置权限
+        #endif
+    }
+    return 0;
+}
+
+// 删除目录中所有 .chunk 文件的辅助函数
+void delete_chunk_files_in_directory(const char *dir) {
+    DIR *d;
+    struct dirent *entry;
+    
+    d = opendir(dir);
+    if (d) {
+        while ((entry = readdir(d)) != NULL) {
+            // 检查是否是 .chunk 文件
+            if (strstr(entry->d_name, ".chunk") != NULL) {
+                char filepath[512];
+                snprintf(filepath, sizeof(filepath), "%s/%s", dir, entry->d_name);
+                remove(filepath);
+                printf("Deleted: %s\n", filepath);
+            }
+        }
+        closedir(d);
+    }
+}
+
+// 删除元数据文件的辅助函数
+void delete_metadata_file(const char *input_filename) {
+    char metadata_filename[256];
+    snprintf(metadata_filename, sizeof(metadata_filename), "./%s.metadata", input_filename);
+    
+    if (remove(metadata_filename) == 0) {
+        printf("Deleted metadata file: %s\n", metadata_filename);
+    }
+}
+
+// 检查文件是否已存在于服务器目录中的辅助函数
+int file_exists_in_server(const char *filename) {
+    char filepath1[512], filepath2[512];
+    snprintf(filepath1, sizeof(filepath1), "./server1/%s", filename);
+    snprintf(filepath2, sizeof(filepath2), "./server2/%s", filename);
+    
+    FILE *f1 = fopen(filepath1, "rb");
+    if (f1) {
+        fclose(f1);
+        return 1; // 文件在 server1 中存在
+    }
+    
+    FILE *f2 = fopen(filepath2, "rb");
+    if (f2) {
+        fclose(f2);
+        return 2; // 文件在 server2 中存在
+    }
+    
+    return 0; // 文件不存在
+}
+
+// 分块函数
+int fastcdc_chunking(FILE *fp, unsigned char *fileCache, const char* input_filename) {
+    uint64_t feature = 0;
+    uint64_t weakhash = 0;
+    size_t readStatus = 0;
+ 
+    int chunk_num = 0;
+
+    memset(fileCache, 0, MAX_CACHE_SIZE);
+
+    int offset = 0, chunkLength = 0;
+    fastCDC_init();
+
+    if (fp == NULL) {
+        perror("Fail to open file");
+        exit(-1);
+    }
+
+    readStatus = fread(fileCache, 1, MAX_CACHE_SIZE, fp);
+    int end = readStatus;
+    int maxchunksum = (readStatus / MinSize) + 1;
+    int *boundary = malloc(maxchunksum * sizeof(int));  // 动态分配边界数组
+    uint64_t *fastfps = malloc(maxchunksum * sizeof(uint64_t));  // 存储每个块的 FastFp
+    
+    if (boundary == NULL || fastfps == NULL) {
+        perror("Memory allocation failed");
+        free(boundary);
+        free(fastfps);
+        exit(-1);
+    }
+         
+    switch (USE_CHUNKING_METHOD)
+    {
+        case ORIGIN_CDC:
+            chunking = cdc_origin_64;
+            break;
+
+        case ROLLING_2Bytes:
+            chunking = rolling_data_2byes_64;
+            break;
+        
+        case NORMALIZED_CDC:
+            chunking = normalized_chunking_64;
+            break;
+
+        case NORMALIZED_2Bytes:
+            chunking = normalized_chunking_2byes_64;
+          
