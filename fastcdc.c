@@ -5,6 +5,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <openssl/sha.h>
 
 // USE_CHUNKING_METHOD
 #define USE_CHUNKING_METHOD 1
@@ -24,59 +25,215 @@ int create_directory_if_not_exists(const char *dir) {
     return 0;
 }
 
-// 删除目录中所有 .chunk 文件的辅助函数
-void delete_chunk_files_in_directory(const char *dir) {
+// 计算 SHA1 哈希的辅助函数
+void calculate_sha1(const unsigned char *data, size_t len, unsigned char *sha1_hash) {
+    SHA1(data, len, sha1_hash);
+}
+
+// 打印 SHA1 哈希值的辅助函数
+void print_sha1_hash(const unsigned char *hash, const char *label) {
+    printf("  %s: ", label);
+    for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+        printf("%02x", hash[i]);
+    }
+    printf("\n");
+}
+
+// 检查文件是否已存在于服务器目录中的辅助函数（FastFp + SHA1 双重校验）
+int file_exists_in_server_with_strong_hash(const char *new_chunk_data, size_t new_chunk_size, uint64_t fastfp) {
+    char filepath1[512], filepath2[512];
+    snprintf(filepath1, sizeof(filepath1), "./server1/%016lx.chunk", fastfp);
+    snprintf(filepath2, sizeof(filepath2), "./server2/%016lx.chunk", fastfp);
+    
+    // 检查 server1
+    FILE *f1 = fopen(filepath1, "rb");
+    if (f1) {
+        // 读取现有分块内容
+        fseek(f1, 0, SEEK_END);
+        long existing_size = ftell(f1);
+        fseek(f1, 0, SEEK_SET);
+        
+        if (existing_size == (long)new_chunk_size) {
+            unsigned char *existing_data = malloc(existing_size);
+            if (existing_data) {
+                fread(existing_data, 1, existing_size, f1);
+                
+                // 计算现有分块的 SHA1
+                unsigned char existing_sha1[SHA_DIGEST_LENGTH];
+                calculate_sha1(existing_data, existing_size, existing_sha1);
+                
+                // 计算新分块的 SHA1
+                unsigned char new_sha1[SHA_DIGEST_LENGTH];
+                calculate_sha1(new_chunk_data, new_chunk_size, new_sha1);
+                
+                // 比较 SHA1 哈希
+                int sha1_match = 1;
+                for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+                    if (existing_sha1[i] != new_sha1[i]) {
+                        sha1_match = 0;
+                        break;
+                    }
+                }
+                
+                printf("  -> FastFp 0x%016lx found in server1 (size: %ld), SHA1 comparison: ", fastfp, existing_size);
+                if (sha1_match) {
+                    printf("MATCH\n");
+                    print_sha1_hash(existing_sha1, "Existing SHA1");
+                    print_sha1_hash(new_sha1, "New SHA1");
+                    printf("  -> Identical content, skipping upload\n");
+                } else {
+                    printf("MISMATCH\n");
+                    print_sha1_hash(existing_sha1, "Existing SHA1");
+                    print_sha1_hash(new_sha1, "New SHA1");
+                    printf("  -> Different content despite same FastFp, will upload new chunk\n");
+                }
+                
+                free(existing_data);
+                
+                if (sha1_match) {
+                    fclose(f1);
+                    return 1; // 找到相同的分块在 server1
+                }
+            }
+        } else {
+            printf("  -> FastFp 0x%016lx found in server1 but size differs (%ld vs %zu), will upload new chunk\n", 
+                   fastfp, existing_size, new_chunk_size);
+        }
+        fclose(f1);
+    }
+    
+    // 检查 server2
+    FILE *f2 = fopen(filepath2, "rb");
+    if (f2) {
+        // 读取现有分块内容
+        fseek(f2, 0, SEEK_END);
+        long existing_size = ftell(f2);
+        fseek(f2, 0, SEEK_SET);
+        
+        if (existing_size == (long)new_chunk_size) {
+            unsigned char *existing_data = malloc(existing_size);
+            if (existing_data) {
+                fread(existing_data, 1, existing_size, f2);
+                
+                // 计算现有分块的 SHA1
+                unsigned char existing_sha1[SHA_DIGEST_LENGTH];
+                calculate_sha1(existing_data, existing_size, existing_sha1);
+                
+                // 计算新分块的 SHA1
+                unsigned char new_sha1[SHA_DIGEST_LENGTH];
+                calculate_sha1(new_chunk_data, new_chunk_size, new_sha1);
+                
+                // 比较 SHA1 哈希
+                int sha1_match = 1;
+                for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+                    if (existing_sha1[i] != new_sha1[i]) {
+                        sha1_match = 0;
+                        break;
+                    }
+                }
+                
+                printf("  -> FastFp 0x%016lx found in server2 (size: %ld), SHA1 comparison: ", fastfp, existing_size);
+                if (sha1_match) {
+                    printf("MATCH\n");
+                    print_sha1_hash(existing_sha1, "Existing SHA1");
+                    print_sha1_hash(new_sha1, "New SHA1");
+                    printf("  -> Identical content, skipping upload\n");
+                } else {
+                    printf("MISMATCH\n");
+                    print_sha1_hash(existing_sha1, "Existing SHA1");
+                    print_sha1_hash(new_sha1, "New SHA1");
+                    printf("  -> Different content despite same FastFp, will upload new chunk\n");
+                }
+                
+                free(existing_data);
+                
+                if (sha1_match) {
+                    fclose(f2);
+                    return 2; // 找到相同的分块在 server2
+                }
+            }
+        } else {
+            printf("  -> FastFp 0x%016lx found in server2 but size differs (%ld vs %zu), will upload new chunk\n", 
+                   fastfp, existing_size, new_chunk_size);
+        }
+        fclose(f2);
+    }
+    
+    return 0; // 文件不存在或内容不同
+}
+
+// 清理旧分块文件，只保留当前文件的分块
+void cleanup_old_chunks(uint64_t *current_fastfps, int chunk_num) {
     DIR *d;
     struct dirent *entry;
+    int i, j;
+    int is_current_chunk;
     
-    d = opendir(dir);
+    // 检查 server1
+    d = opendir("./server1");
     if (d) {
         while ((entry = readdir(d)) != NULL) {
             // 检查是否是 .chunk 文件
             if (strstr(entry->d_name, ".chunk") != NULL) {
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "%s/%s", dir, entry->d_name);
-                remove(filepath);
-                printf("Deleted: %s\n", filepath);
+                // 从文件名解析 FastFp
+                uint64_t chunk_fastfp;
+                if (sscanf(entry->d_name, "%16lx.chunk", &chunk_fastfp) == 1) {
+                    // 检查这个 FastFp 是否在当前文件的分块列表中
+                    is_current_chunk = 0;
+                    for (i = 0; i < chunk_num; i++) {
+                        if (current_fastfps[i] == chunk_fastfp) {
+                            is_current_chunk = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (!is_current_chunk) {
+                        // 不是当前文件的分块，删除它
+                        char filepath[512];
+                        snprintf(filepath, sizeof(filepath), "./server1/%s", entry->d_name);
+                        remove(filepath);
+                        printf("Deleted old chunk: %s\n", filepath);
+                    }
+                }
+            }
+        }
+        closedir(d);
+    }
+    
+    // 检查 server2
+    d = opendir("./server2");
+    if (d) {
+        while ((entry = readdir(d)) != NULL) {
+            // 检查是否是 .chunk 文件
+            if (strstr(entry->d_name, ".chunk") != NULL) {
+                // 从文件名解析 FastFp
+                uint64_t chunk_fastfp;
+                if (sscanf(entry->d_name, "%16lx.chunk", &chunk_fastfp) == 1) {
+                    // 检查这个 FastFp 是否在当前文件的分块列表中
+                    is_current_chunk = 0;
+                    for (i = 0; i < chunk_num; i++) {
+                        if (current_fastfps[i] == chunk_fastfp) {
+                            is_current_chunk = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (!is_current_chunk) {
+                        // 不是当前文件的分块，删除它
+                        char filepath[512];
+                        snprintf(filepath, sizeof(filepath), "./server2/%s", entry->d_name);
+                        remove(filepath);
+                        printf("Deleted old chunk: %s\n", filepath);
+                    }
+                }
             }
         }
         closedir(d);
     }
 }
 
-// 删除元数据文件的辅助函数
-void delete_metadata_file(const char *input_filename) {
-    char metadata_filename[256];
-    snprintf(metadata_filename, sizeof(metadata_filename), "./%s.metadata", input_filename);
-    
-    if (remove(metadata_filename) == 0) {
-        printf("Deleted metadata file: %s\n", metadata_filename);
-    }
-}
-
-// 检查文件是否已存在于服务器目录中的辅助函数
-int file_exists_in_server(const char *filename) {
-    char filepath1[512], filepath2[512];
-    snprintf(filepath1, sizeof(filepath1), "./server1/%s", filename);
-    snprintf(filepath2, sizeof(filepath2), "./server2/%s", filename);
-    
-    FILE *f1 = fopen(filepath1, "rb");
-    if (f1) {
-        fclose(f1);
-        return 1; // 文件在 server1 中存在
-    }
-    
-    FILE *f2 = fopen(filepath2, "rb");
-    if (f2) {
-        fclose(f2);
-        return 2; // 文件在 server2 中存在
-    }
-    
-    return 0; // 文件不存在
-}
-
 // 分块函数
-int fastcdc_chunking(FILE *fp, unsigned char *fileCache, const char* input_filename) {
+int fastcdc_chunking(FILE *fp, unsigned char *fileCache) {
     uint64_t feature = 0;
     uint64_t weakhash = 0;
     size_t readStatus = 0;
@@ -140,180 +297,56 @@ int fastcdc_chunking(FILE *fp, unsigned char *fileCache, const char* input_filen
             break;
     }
 
-    // 创建目录并清理之前的 .chunk 文件
+    // 创建目录
     create_directory_if_not_exists("./server1");
     create_directory_if_not_exists("./server2");
     
-    printf("Cleaning old chunk files...\n");
-    delete_chunk_files_in_directory("./server1");
-    delete_chunk_files_in_directory("./server2");
-    
-    // 删除旧的元数据文件
-    delete_metadata_file(input_filename);
-    
-    // 创建元数据文件，记录块的顺序和位置信息
-    char metadata_filename[256];
-    snprintf(metadata_filename, sizeof(metadata_filename), "./%s.metadata", input_filename);
-    FILE *metadata_file = fopen(metadata_filename, "w");
-    if (metadata_file) {
-        fprintf(metadata_file, "filename=%s\n", input_filename);
-        fprintf(metadata_file, "chunk_count=%d\n", chunk_num);
-        fprintf(metadata_file, "chunk_server=server1,server2\n"); // 记录块分布策略
-        fclose(metadata_file);
-    }
-    
-    // 输出分块信息（包含 FastFp）并写入块文件到不同目录
+    // 输出分块信息（包含 FastFp）并写入块文件
     offset = 0;
     for(int i = 0; i < chunk_num; i++){
         printf("Chunk %d: offset=%d, length=%d, fastfp=0x%016lx\n", 
                i, offset, boundary[i], fastfps[i]);
         
-        // 生成文件名
-        char filename[64];
-        sprintf(filename, "%016lx.chunk", fastfps[i]);
+        // 获取当前块的数据
+        unsigned char *current_chunk_data = fileCache + offset;
+        size_t current_chunk_size = boundary[i];
         
-        // 检查文件是否已存在
-        int exists = file_exists_in_server(filename);
+        // 检查是否已存在相同内容的分块（FastFp + SHA1 双重校验）
+        int exists = file_exists_in_server_with_strong_hash(current_chunk_data, current_chunk_size, fastfps[i]);
+        
         if (exists) {
-            printf("  -> File %s already exists in server%d, skipping upload\n", filename, exists);
+            printf("  -> Chunk with fastfp 0x%016lx already exists in server%d, skipping upload\n", fastfps[i], exists);
         } else {
             // 决定保存到哪个目录：偶数块到server1，奇数块到server2
-            char filepath[64];
+            char filename[64];
             if (i % 2 == 0) {
-                sprintf(filepath, "./server1/%s", filename);
+                sprintf(filename, "./server1/%016lx.chunk", fastfps[i]);
             } else {
-                sprintf(filepath, "./server2/%s", filename);
+                sprintf(filename, "./server2/%016lx.chunk", fastfps[i]);
             }
             
             // 写入块文件
-            FILE *chunk_file = fopen(filepath, "wb");
+            FILE *chunk_file = fopen(filename, "wb");
             if (chunk_file != NULL) {
-                fwrite(fileCache + offset, 1, boundary[i], chunk_file);
+                fwrite(current_chunk_data, 1, current_chunk_size, chunk_file);
                 fclose(chunk_file);
-                printf("  -> Saved to %s\n", filepath);
+                printf("  -> Saved to %s\n", filename);
             } else {
-                printf("  -> Failed to save to %s\n", filepath);
+                printf("  -> Failed to save to %s\n", filename);
             }
         }
         
         offset += boundary[i];
     }
     
-    // 更新元数据文件，添加每个块的详细信息
-    metadata_file = fopen(metadata_filename, "a");
-    if (metadata_file) {
-        for(int i = 0; i < chunk_num; i++) {
-            fprintf(metadata_file, "chunk_%d=0x%016lx,%s,%s\n", 
-                   i, fastfps[i], 
-                   (i % 2 == 0) ? "server1" : "server2",
-                   (i % 2 == 0) ? "./server1" : "./server2");
-        }
-        fclose(metadata_file);
-    }
+    // 清理旧的分块文件，只保留当前文件的分块
+    cleanup_old_chunks(fastfps, chunk_num);
     
     printf("Total chunk number is %d\n", chunk_num);
 
     free(boundary);  // 释放边界数组内存
     free(fastfps);   // 释放 FastFp 数组内存
     return offset;
-}
-
-// 恢复文件函数
-int restore_file(const char* input_metadata_filename, const char* output_filename) {
-    FILE *output_file = fopen(output_filename, "wb");
-    if (!output_file) {
-        perror("Failed to open output file for restoration");
-        return -1;
-    }
-    
-    printf("Restoring file from chunks using metadata: %s\n", input_metadata_filename);
-    
-    // 读取元数据文件
-    FILE *metadata_file = fopen(input_metadata_filename, "r");
-    if (!metadata_file) {
-        perror("Failed to open metadata file");
-        fclose(output_file);
-        return -1;
-    }
-    
-    char line[512];
-    int chunk_count = 0;
-    char filename[256];
-    
-    // 读取基本元数据
-    while (fgets(line, sizeof(line), metadata_file)) {
-        if (strncmp(line, "chunk_count=", 12) == 0) {
-            sscanf(line, "chunk_count=%d", &chunk_count);
-        } else if (strncmp(line, "filename=", 9) == 0) {
-            sscanf(line, "filename=%s", filename);
-        }
-    }
-    
-    // 重置文件指针以读取块信息
-    rewind(metadata_file);
-    
-    // 创建一个临时数组来存储块信息
-    char **chunk_fps = malloc(chunk_count * sizeof(char*));
-    char **chunk_servers = malloc(chunk_count * sizeof(char*));
-    for(int i = 0; i < chunk_count; i++) {
-        chunk_fps[i] = malloc(17); // 16 hex chars + null terminator
-        chunk_servers[i] = malloc(8); // "server1" or "server2" + null terminator
-    }
-    
-    // 读取块信息
-    while (fgets(line, sizeof(line), metadata_file)) {
-        int chunk_idx;
-        char chunk_fp[17], server[8];
-        if (sscanf(line, "chunk_%d=0x%16s,%7s,", &chunk_idx, chunk_fp, server) == 3) {
-            if (chunk_idx >= 0 && chunk_idx < chunk_count) {
-                strcpy(chunk_fps[chunk_idx], chunk_fp);
-                strcpy(chunk_servers[chunk_idx], server);
-            }
-        }
-    }
-    
-    fclose(metadata_file);
-    
-    // 按顺序恢复文件
-    for (int i = 0; i < chunk_count; i++) {
-        char chunk_filename[64];
-        snprintf(chunk_filename, sizeof(chunk_filename), "%s.chunk", chunk_fps[i]);
-        
-        char filepath[512];
-        snprintf(filepath, sizeof(filepath), "./%s/%s", chunk_servers[i], chunk_filename);
-        
-        FILE *chunk_file = fopen(filepath, "rb");
-        if (chunk_file) {
-            // 获取文件大小
-            fseek(chunk_file, 0, SEEK_END);
-            long chunk_size = ftell(chunk_file);
-            fseek(chunk_file, 0, SEEK_SET);
-            
-            // 读取并写入块数据
-            unsigned char *chunk_data = malloc(chunk_size);
-            if (chunk_data) {
-                fread(chunk_data, 1, chunk_size, chunk_file);
-                fwrite(chunk_data, 1, chunk_size, output_file);
-                free(chunk_data);
-            }
-            fclose(chunk_file);
-            printf("  -> Restored chunk %d from %s\n", i, filepath);
-        } else {
-            printf("  -> Chunk %d not found at %s\n", i, filepath);
-        }
-    }
-    
-    // 释放内存
-    for(int i = 0; i < chunk_count; i++) {
-        free(chunk_fps[i]);
-        free(chunk_servers[i]);
-    }
-    free(chunk_fps);
-    free(chunk_servers);
-    
-    fclose(output_file);
-    printf("File restoration completed: %s\n", output_filename);
-    return 0;
 }
 
 // functions
@@ -499,48 +532,36 @@ int cdc_origin_64(unsigned char *p, int n,uint64_t *feature,uint64_t *weakhash){
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <input_file> [restore_output_file]\n", argv[0]);
-        fprintf(stderr, "  Example: %s myfile.bin                    # 分块处理\n", argv[0]);
-        fprintf(stderr, "  Example: %s myfile.bin restored.bin      # 恢复文件\n", argv[0]);
-        exit(1);
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
+        exit(-1);
     }
     
     gettimeofday(&tmStart, NULL);
-    
-    if (argc == 2) {
-        // 分块处理模式
-        FILE* read = fopen(argv[1], "rb");  // 从命令行参数获取输入文件
-        if (read == NULL) {
-            perror("Fail to open file");
-            exit(-1);
-        }
-        
-        // 使用较小的缓存大小以避免内存问题
-        unsigned char *fileCache = (unsigned char *)malloc(MAX_CACHE_SIZE);
-        if (fileCache == NULL) {
-            perror("Memory allocation failed for file cache");
-            fclose(read);
-            exit(-1);
-        }
-        
-        int n = fastcdc_chunking(read, fileCache, argv[1]);
-        
-        printf("Processed %d bytes from %s\n", n, argv[1]);
-        
-        gettimeofday(&tmEnd, NULL);
-        totalTm = (tmEnd.tv_sec - tmStart.tv_sec) * 1000000 + tmEnd.tv_usec - tmStart.tv_usec;
-        printf("Total time is %f s\n", totalTm / 1000000);
-        
-        free(fileCache);
-        fclose(read);
-    } else if (argc == 3) {
-        // 恢复模式
-        char metadata_filename[256];
-        snprintf(metadata_filename, sizeof(metadata_filename), "./%s.metadata", argv[1]);
-        printf("Restoring file to: %s using metadata: %s\n", argv[2], metadata_filename);
-        restore_file(metadata_filename, argv[2]);
+    FILE* read = fopen(argv[1], "rb");  // 使用命令行参数指定的文件名
+    if (read == NULL) {
+        perror("Fail to open file");
+        exit(-1);
     }
+    
+    // 使用较小的缓存大小以避免内存问题
+    unsigned char *fileCache = (unsigned char *)malloc(MAX_CACHE_SIZE);
+    if (fileCache == NULL) {
+        perror("Memory allocation failed for file cache");
+        fclose(read);
+        exit(-1);
+    }
+    
+    int n = fastcdc_chunking(read, fileCache);
+    
+    printf("Processed %d bytes\n", n);
+    
+    gettimeofday(&tmEnd, NULL);
+    totalTm = (tmEnd.tv_sec - tmStart.tv_sec) * 1000000 + tmEnd.tv_usec - tmStart.tv_usec;
+    printf("Total time is %f s\n", totalTm / 1000000);
+    
+    free(fileCache);
+    fclose(read);
     
     return 0;
 }

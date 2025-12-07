@@ -1,0 +1,6 @@
+filename=fastcdc
+chunk_count=3
+chunk_server=server1,server2
+chunk_0=0x26c18420f29f2c39,server1,./server1
+chunk_1=0x2ddaa7f2b46fe4e0,server2,./server2
+chunk_2=0x104811dfa5769a97,server1,./server1
