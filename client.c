@@ -1,4 +1,4 @@
-// client.c - 客户端代码
+// client.c - 客户端代码（支持命令行参数指定服务端地址）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,16 +8,113 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <openssl/sha.h>
-#include "fastcdc.h"
+#include <openssl/md5.h>
 
-#define SERVER_PORT1 8080
-#define SERVER_PORT2 8081
+#define DEFAULT_SERVER1_PORT 8080
+#define DEFAULT_SERVER2_PORT 8081
 #define MAX_CACHE_SIZE (100 * 1024 * 1024)
+
+// FastCDC相关常量定义
+#define SymbolCount 256
+#define SeedLength 1
+#define ORIGIN_CDC 1
+#define ROLLING_2Bytes 2
+#define NORMALIZED_CDC 3
+#define NORMALIZED_2Bytes 4
+#define STEP 32
+
+// FastCDC全局变量
+uint32_t g_global_matrix[SymbolCount];
+uint32_t g_global_matrix_left[SymbolCount];
+uint64_t GEARv2[SymbolCount];
+uint64_t LEARv2[SymbolCount];
+uint32_t MinSize, MaxSize, Mask_15, Mask_11, MinSize_divide_by_2;
+uint64_t Mask_11_64, Mask_15_64;
+uint64_t FING_GEAR_02KB_64, FING_GEAR_08KB_64, FING_GEAR_32KB_64;
+uint64_t FING_GEAR_02KB_ls_64, FING_GEAR_32KB_ls_64, FING_GEAR_08KB_ls_64;
+
+// 时间相关
+struct timeval tmStart, tmEnd;
+double totalTm;
+
+// FastCDC函数声明
+void fastCDC_init(void);
+int normalized_chunking_64(unsigned char *p, int n, uint64_t *feature, uint64_t *weakhash);
 
 struct FastFpList {
     uint64_t *fastfps;
     int count;
 };
+
+// FastCDC初始化函数 - 使用MD5初始化
+void fastCDC_init(void) {
+    unsigned char md5_digest[16];
+    uint8_t seed[SeedLength];
+    for (int i = 0; i < SymbolCount; i++) {
+        for (int j = 0; j < SeedLength; j++) {
+            seed[j] = i;
+        }
+        g_global_matrix[i] = 0;
+        MD5(seed, SeedLength, md5_digest);
+        memcpy(&(g_global_matrix[i]), md5_digest, 4);
+        g_global_matrix_left[i] = g_global_matrix[i] << 1;
+    }
+
+    // 64 bit init
+    for (int i = 0; i < SymbolCount; i++) {
+        LEARv2[i] = GEARv2[i] << 1;
+    }
+
+    MinSize = 8192 / 4;
+    MaxSize = 8192 * 4;    // 32768;
+    Mask_15 = 0xf9070353;  //  15个1
+    Mask_11 = 0xd9000353;  //  11个1
+    Mask_11_64 = 0x0000d90003530000;
+    Mask_15_64 = 0x0000f90703530000;
+    MinSize_divide_by_2 = MinSize / 2;
+}
+
+// FastCDC分块函数实现 - 只保留实际使用的函数
+int normalized_chunking_64(unsigned char *p, int n,uint64_t *feature,uint64_t *weakhash) {
+    uint64_t fingerprint = 0;
+    int originalMinSize = MinSize;
+    MinSize = 6 * 1024;
+    int i = MinSize, Mid = 8 * 1024;
+
+    // the minimal subChunk Size.
+    if (n <= MinSize)  
+        return n;
+
+    if (n > MaxSize)
+        n = MaxSize;
+    else if (n < Mid)
+        Mid = n;
+
+    while (i < Mid) {
+        fingerprint = (fingerprint << 1) + (GEARv2[p[i]]);
+
+        if ((!(fingerprint & FING_GEAR_32KB_64))) {
+            MinSize = originalMinSize;  // 恢复原始MinSize
+            return i;
+        }
+
+        i++;
+    }
+
+    while (i < n) {
+        fingerprint = (fingerprint << 1) + (GEARv2[p[i]]);
+
+        if ((!(fingerprint & FING_GEAR_02KB_64))) {
+            MinSize = originalMinSize;  // 恢复原始MinSize
+            return i;
+        }
+
+        i++;
+    }
+
+    MinSize = originalMinSize;  // 恢复原始MinSize
+    return n;
+}
 
 // 计算 SHA1 哈希的辅助函数
 void calculate_sha1(const unsigned char *data, size_t len, unsigned char *sha1_hash) {
@@ -46,12 +143,14 @@ int connect_to_server(const char* ip, int port) {
     serv_addr.sin_port = htons(port);
     
     if(inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address");
+        printf("Invalid address: %s\n", ip);
+        close(sock);
         return -1;
     }
 
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Connection Failed");
+        printf("Connection to %s:%d failed\n", ip, port);
+        close(sock);
         return -1;
     }
     return sock;
@@ -85,11 +184,21 @@ struct FastFpList receive_fastfp_list(int sock) {
     struct FastFpList result = {NULL, 0};
     
     // 接收列表大小
-    recv(sock, &result.count, sizeof(int), 0);
+    if (recv(sock, &result.count, sizeof(int), 0) <= 0) {
+        printf("Failed to receive FastFp list size\n");
+        return result;
+    }
     
     if (result.count > 0) {
         result.fastfps = malloc(result.count * sizeof(uint64_t));
-        recv(sock, result.fastfps, result.count * sizeof(uint64_t), 0);
+        if (result.fastfps) {
+            if (recv(sock, result.fastfps, result.count * sizeof(uint64_t), 0) <= 0) {
+                printf("Failed to receive FastFp list\n");
+                free(result.fastfps);
+                result.fastfps = NULL;
+                result.count = 0;
+            }
+        }
     }
     
     return result;
@@ -110,23 +219,31 @@ void receive_sha1_hashes(int sock, unsigned char *server1_sha1, unsigned char *s
 }
 
 // 客户端主逻辑
-int process_file_on_client(const char* filename) {
+int process_file_on_client(const char* filename, const char* server1_ip, int server1_port, 
+                          const char* server2_ip, int server2_port) {
     // 连接到两个服务器
-    int server1_sock = connect_to_server("127.0.0.1", SERVER_PORT1);
-    int server2_sock = connect_to_server("127.0.0.1", SERVER_PORT2);
+    printf("Connecting to Server1 at %s:%d\n", server1_ip, server1_port);
+    int server1_sock = connect_to_server(server1_ip, server1_port);
+    
+    printf("Connecting to Server2 at %s:%d\n", server2_ip, server2_port);
+    int server2_sock = connect_to_server(server2_ip, server2_port);
     
     if (server1_sock < 0 || server2_sock < 0) {
-        printf("Failed to connect to servers\n");
+        printf("Failed to connect to one or both servers\n");
+        if (server1_sock >= 0) close(server1_sock);
+        if (server2_sock >= 0) close(server2_sock);
         return -1;
     }
     
-    printf("Connected to both servers\n");
+    printf("Connected to both servers successfully\n");
     
     // 向两个服务器发送文件
+    printf("Sending file to servers...\n");
     send_file_data(server1_sock, filename);
     send_file_data(server2_sock, filename);
     
     // 接收两个服务器的FastFp列表
+    printf("Receiving FastFp lists from servers...\n");
     struct FastFpList server1_fastfps = receive_fastfp_list(server1_sock);
     struct FastFpList server2_fastfps = receive_fastfp_list(server2_sock);
     
@@ -140,6 +257,8 @@ int process_file_on_client(const char* filename) {
         perror("Cannot open local file");
         close(server1_sock);
         close(server2_sock);
+        if (server1_fastfps.fastfps) free(server1_fastfps.fastfps);
+        if (server2_fastfps.fastfps) free(server2_fastfps.fastfps);
         return -1;
     }
     
@@ -149,6 +268,8 @@ int process_file_on_client(const char* filename) {
         fclose(local_file);
         close(server1_sock);
         close(server2_sock);
+        if (server1_fastfps.fastfps) free(server1_fastfps.fastfps);
+        if (server2_fastfps.fastfps) free(server2_fastfps.fastfps);
         return -1;
     }
     
@@ -170,6 +291,8 @@ int process_file_on_client(const char* filename) {
         free(local_fastfps);
         close(server1_sock);
         close(server2_sock);
+        if (server1_fastfps.fastfps) free(server1_fastfps.fastfps);
+        if (server2_fastfps.fastfps) free(server2_fastfps.fastfps);
         return -1;
     }
     
@@ -204,8 +327,8 @@ int process_file_on_client(const char* filename) {
                 matched_indices[match_count] = i;
                 matching_fastfps[match_count] = current_fastfp;
                 match_count++;
-                matched = 1;
                 printf("Chunk %d (FastFp: 0x%016lx) matches server1\n", i, current_fastfp);
+                matched = 1;
                 break;
             }
         }
@@ -217,8 +340,8 @@ int process_file_on_client(const char* filename) {
                     matched_indices[match_count] = i;
                     matching_fastfps[match_count] = current_fastfp;
                     match_count++;
-                    matched = 1;
                     printf("Chunk %d (FastFp: 0x%016lx) matches server2\n", i, current_fastfp);
+                    matched = 1;
                     break;
                 }
             }
@@ -228,6 +351,7 @@ int process_file_on_client(const char* filename) {
     printf("Found %d potential matches based on FastFp\n", match_count);
     
     // 向服务器发送匹配的FastFp列表
+    printf("Sending matching FastFp list to servers...\n");
     send_matching_fastfps(server1_sock, matching_fastfps, match_count);
     send_matching_fastfps(server2_sock, matching_fastfps, match_count);
     
@@ -235,6 +359,7 @@ int process_file_on_client(const char* filename) {
     unsigned char *server1_sha1_hashes = malloc(match_count * SHA_DIGEST_LENGTH);
     unsigned char *server2_sha1_hashes = malloc(match_count * SHA_DIGEST_LENGTH);
     
+    printf("Receiving SHA1 hashes from servers...\n");
     receive_sha1_hashes(server1_sock, server1_sha1_hashes, server2_sha1_hashes, match_count);
     
     // 本地计算SHA1并比较
@@ -243,16 +368,14 @@ int process_file_on_client(const char* filename) {
         int chunk_idx = matched_indices[i];
         uint64_t fastfp = matching_fastfps[i];
         
-        // 计算本地块的SHA1
-        unsigned char local_sha1[SHA_DIGEST_LENGTH];
-        unsigned char *chunk_data = fileCache + (boundary[chunk_idx] ? 0 : 0); // 简化处理
-        
         // 计算正确的偏移量
         int calc_offset = 0;
         for (int j = 0; j < chunk_idx; j++) {
             calc_offset += boundary[j];
         }
         
+        // 计算本地块的SHA1
+        unsigned char local_sha1[SHA_DIGEST_LENGTH];
         calculate_sha1(fileCache + calc_offset, boundary[chunk_idx], local_sha1);
         
         // 比较SHA1
@@ -322,6 +445,8 @@ int process_file_on_client(const char* filename) {
         }
     }
     
+    printf("Uploading %d new chunks to servers...\n", upload_count);
+    
     // 发送需要上传的块数量
     send(server1_sock, &upload_count, sizeof(int), 0);
     send(server2_sock, &upload_count, sizeof(int), 0);
@@ -376,18 +501,47 @@ int process_file_on_client(const char* filename) {
     return 0;
 }
 
+void print_usage(const char* program_name) {
+    printf("Usage: %s <filename> [server1_ip] [server1_port] [server2_ip] [server2_port]\n", program_name);
+    printf("Example: %s myfile.txt 192.168.1.10 8080 192.168.1.11 8081\n", program_name);
+    printf("Default server1: 127.0.0.1:8080, server2: 127.0.0.1:8081\n");
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
+    if (argc < 2) {
+        print_usage(argv[0]);
         return -1;
     }
     
-    printf("Starting distributed FastCDC client for file: %s\n", argv[1]);
+    const char* filename = argv[1];
+    
+    // 设置默认服务器地址和端口
+    const char* server1_ip = "127.0.0.1";
+    int server1_port = DEFAULT_SERVER1_PORT;
+    const char* server2_ip = "127.0.0.1";
+    int server2_port = DEFAULT_SERVER2_PORT;
+    
+    // 解析命令行参数
+    if (argc >= 6) {
+        server1_ip = argv[2];
+        server1_port = atoi(argv[3]);
+        server2_ip = argv[4];
+        server2_port = atoi(argv[5]);
+    } else if (argc > 2) {
+        printf("Error: Invalid number of arguments\n");
+        print_usage(argv[0]);
+        return -1;
+    }
+    
+    printf("Starting distributed FastCDC client for file: %s\n", filename);
+    printf("Server1: %s:%d\n", server1_ip, server1_port);
+    printf("Server2: %s:%d\n", server2_ip, server2_port);
     
     struct timeval start, end;
     gettimeofday(&start, NULL);
     
-    int result = process_file_on_client(argv[1]);
+    int result = process_file_on_client(filename, server1_ip, server1_port, 
+                                       server2_ip, server2_port);
     
     gettimeofday(&end, NULL);
     double total_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;

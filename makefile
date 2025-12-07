@@ -3,7 +3,7 @@ CFLAGS = -g -Wall -std=c99
 LIBS = -lssl -lcrypto
 
 # 目标文件
-CLIENT_OBJ = client.o fastcdc.o
+CLIENT_OBJ = client.o
 SERVER1_OBJ = server1.o
 SERVER2_OBJ = server2.o
 
@@ -19,7 +19,7 @@ all: $(CLIENT) $(SERVER1) $(SERVER2)
 $(CLIENT): $(CLIENT_OBJ)
 	$(CC) $(CLIENT_OBJ) -o $(CLIENT) $(LIBS)
 
-client.o: client.c fastcdc.h
+client.o: client.c
 	$(CC) $(CFLAGS) -c client.c
 
 # 服务端1
@@ -36,10 +36,6 @@ $(SERVER2): $(SERVER2_OBJ)
 server2.o: server2.c
 	$(CC) $(CFLAGS) -c server2.c
 
-# FastCDC库
-fastcdc.o: fastcdc.c fastcdc.h
-	$(CC) $(CFLAGS) -c fastcdc.c
-
 # 便捷目标
 client: $(CLIENT)
 server1: $(SERVER1)
@@ -51,6 +47,3 @@ clean:
 
 # 伪目标
 .PHONY: all clean client server1 server2
-
-# 依赖关系
-$(CLIENT_OBJ): fastcdc.h
