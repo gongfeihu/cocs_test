@@ -1,0 +1,75 @@
+Starting server1 on port 8082
+Server1 listening on port 8082, storing chunks in ./server1file/
+Handling client connection from 127.0.0.1
+Received file: random.txt from client 127.0.0.1
+Receiving file of size: 102400 bytes
+Found 0 existing chunks in ./server1file directory
+No existing chunks in directory, sent 0 count to client 127.0.0.1
+Client reported 0 matching FastFps
+No matching FastFps to verify, skipping SHA1 calculation
+Receiving 5 new chunks from client 127.0.0.1
+Saved chunk to ./server1file/8f1b04b258845d85.chunk (size: 8321) from client 127.0.0.1
+Saved chunk to ./server1file/10f6264528acdf6e.chunk (size: 8253) from client 127.0.0.1
+Saved chunk to ./server1file/a4720680e4287be6.chunk (size: 12586) from client 127.0.0.1
+Saved chunk to ./server1file/cc3206c33404a00f.chunk (size: 8854) from client 127.0.0.1
+Saved chunk to ./server1file/1f0322eacca860b5.chunk (size: 8846) from client 127.0.0.1
+Finished handling client 127.0.0.1 on server1
+Handling client connection from 127.0.0.1
+Received file: random.txt from client 127.0.0.1
+Receiving file of size: 102400 bytes
+Found 5 existing chunks in ./server1file directory
+Sent 5 FastFp values to client 127.0.0.1
+Client reported 5 matching FastFps
+Calculated SHA1 for existing chunk 0x8f1b04b258845d85
+Calculated SHA1 for existing chunk 0x10f6264528acdf6e
+Calculated SHA1 for existing chunk 0xa4720680e4287be6
+Calculated SHA1 for existing chunk 0xcc3206c33404a00f
+Calculated SHA1 for existing chunk 0x1f0322eacca860b5
+Receiving 0 new chunks from client 127.0.0.1
+Cleaning up chunks not in current file...
+Finished handling client 127.0.0.1 on server1
+Handling client connection from 127.0.0.1
+Received file: random_copy.txt from client 127.0.0.1
+Receiving file of size: 101701 bytes
+Found 5 existing chunks in ./server1file directory
+Sent 5 FastFp values to client 127.0.0.1
+Client reported 3 matching FastFps
+Calculated SHA1 for existing chunk 0xa4720680e4287be6
+Calculated SHA1 for existing chunk 0xcc3206c33404a00f
+Calculated SHA1 for existing chunk 0x1f0322eacca860b5
+Receiving 2 new chunks from client 127.0.0.1
+Saved chunk to ./server1file/7f9f22ac7824c6f7.chunk (size: 10949) from client 127.0.0.1
+Saved chunk to ./server1file/b60e0633802c42e3.chunk (size: 12818) from client 127.0.0.1
+Cleaning up chunks not in current file...
+Deleted old chunk file: ./server1file/8f1b04b258845d85.chunk
+Deleted old chunk file: ./server1file/10f6264528acdf6e.chunk
+Finished handling client 127.0.0.1 on server1
+Handling client connection from 127.0.0.1
+Received file: random.txt from client 127.0.0.1
+Receiving file of size: 102400 bytes
+Found 5 existing chunks in ./server1file directory
+Sent 5 FastFp values to client 127.0.0.1
+Client reported 3 matching FastFps
+Calculated SHA1 for existing chunk 0xa4720680e4287be6
+Calculated SHA1 for existing chunk 0xcc3206c33404a00f
+Calculated SHA1 for existing chunk 0x1f0322eacca860b5
+Receiving 2 new chunks from client 127.0.0.1
+Saved chunk to ./server1file/8f1b04b258845d85.chunk (size: 8321) from client 127.0.0.1
+Saved chunk to ./server1file/10f6264528acdf6e.chunk (size: 8253) from client 127.0.0.1
+Cleaning up chunks not in current file...
+Deleted old chunk file: ./server1file/7f9f22ac7824c6f7.chunk
+Deleted old chunk file: ./server1file/b60e0633802c42e3.chunk
+Finished handling client 127.0.0.1 on server1
+Handling client connection from 127.0.0.1
+Received file: random.txt from client 127.0.0.1
+Receiving file of size: 102400 bytes
+Found 0 existing chunks in ./server1file directory
+No existing chunks in directory, sent 0 count to client 127.0.0.1
+Client reported 0 matching FastFps
+No matching FastFps to verify, skipping SHA1 calculation
+Receiving 5 new chunks from client 127.0.0.1
+Saved chunk to ./server1file/8f1b04b258845d85.chunk (size: 8321) from client 127.0.0.1
+Saved chunk to ./server1file/10f6264528acdf6e.chunk (size: 8253) from client 127.0.0.1
+Saved chunk to ./server1file/a4720680e4287be6.chunk (size: 12586) from client 127.0.0.1
+Saved chunk to ./server1file/cc3206c33404a00f.chunk (size: 8854) from client 127.0.0.1
+Saved chunk to ./server1file/1f0322eacca860b5.chunk (s

@@ -103,8 +103,14 @@ int recv_all(int socket, void *buffer, size_t length) {
     
     while (received < length) {
         int result = recv(socket, buf + received, length - received, 0);
-        if (result <= 0) {
-            return result;
+        if (result < 0) {
+            perror("recv_all error");
+            return -1;
+        }
+        if (result == 0) {
+            // 连接已关闭
+            printf("Connection closed by peer, received %zu/%zu bytes\n", received, length);
+            return -1;
         }
         received += result;
     }
@@ -131,28 +137,23 @@ void cleanup_chunks_not_in_list(const char* dir_path, uint64_t *current_fastfps,
     DIR *d;
     struct dirent *entry;
     
-    // 创建一个简单的哈希表来标记当前文件的FastFp
-    int *fastfp_exists = calloc(10000, sizeof(int));
-    if (!fastfp_exists) return;
-    
-    // 标记当前文件的FastFp
-    for (int i = 0; i < count; i++) {
-        int index = (current_fastfps[i] % 10000);
-        if (index < 0) index = -index;
-        fastfp_exists[index] = 1;
-    }
-    
     d = opendir(dir_path);
     if (d) {
         while ((entry = readdir(d)) != NULL) {
             if (strstr(entry->d_name, ".chunk") != NULL) {
                 uint64_t fastfp;
                 if (sscanf(entry->d_name, "%016lx.chunk", &fastfp) == 1) {
-                    int index = (fastfp % 10000);
-                    if (index < 0) index = -index;
+                    // 检查当前FastFp是否在列表中
+                    int found = 0;
+                    for (int i = 0; i < count; i++) {
+                        if (current_fastfps[i] == fastfp) {
+                            found = 1;
+                            break;
+                        }
+                    }
                     
                     // 如果当前FastFp不在当前文件的列表中，则删除该文件
-                    if (fastfp_exists[index] == 0) {
+                    if (!found) {
                         char chunk_path[512];
                         snprintf(chunk_path, sizeof(chunk_path), "%s/%s", dir_path, entry->d_name);
                         if (remove(chunk_path) == 0) {
@@ -166,8 +167,6 @@ void cleanup_chunks_not_in_list(const char* dir_path, uint64_t *current_fastfps,
         }
         closedir(d);
     }
-    
-    free(fastfp_exists);
 }
 
 // 处理客户端连接
@@ -200,12 +199,25 @@ void handle_client(int client_socket, struct sockaddr_in *client_addr) {
     
     printf("Received file: %s from client %s\n", filename, client_ip);
     
+    // 接收文件大小
+    long file_size = 0;
+    if (recv_all(client_socket, &file_size, sizeof(long)) <= 0) {
+        printf("Failed to receive file size from %s: %s\n", client_ip, strerror(errno));
+        return;
+    }
+    
+    printf("Receiving file of size: %ld bytes\n", file_size);
+    
     // 丢弃文件内容
     unsigned char buffer[4096];
-    size_t total_size = 0;
+    long total_size = 0;
     ssize_t bytes_read;
-    while ((bytes_read = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
+    while (total_size < file_size && (bytes_read = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
         total_size += bytes_read;
+    }
+    
+    if (total_size != file_size) {
+        printf("Warning: Expected %ld bytes but received %ld bytes\n", file_size, total_size);
     }
     
     // 收集当前目录中的所有FastFp
@@ -231,11 +243,37 @@ void handle_client(int client_socket, struct sockaddr_in *client_addr) {
         printf("No existing chunks in directory, sent 0 count to client %s\n", client_ip);
     }
     
+    // 接收当前文件的所有FastFp（用于清理旧块）
+    int current_file_chunk_count = 0;
+    uint64_t *current_file_fastfps_from_client = NULL;
+    
+    if (recv_all(client_socket, &current_file_chunk_count, sizeof(int)) <= 0) {
+        printf("Failed to receive current file chunk count from %s: %s\n", client_ip, strerror(errno));
+        if (all_fastfps) free(all_fastfps);
+        return;
+    }
+    
+    if (current_file_chunk_count > 0) {
+        current_file_fastfps_from_client = malloc(current_file_chunk_count * sizeof(uint64_t));
+        if (!current_file_fastfps_from_client) {
+            printf("Memory allocation failed for current file FastFps\n");
+            if (all_fastfps) free(all_fastfps);
+            return;
+        }
+        if (recv_all(client_socket, current_file_fastfps_from_client, current_file_chunk_count * sizeof(uint64_t)) <= 0) {
+            printf("Failed to receive current file FastFp list from %s: %s\n", client_ip, strerror(errno));
+            free(all_fastfps);
+            free(current_file_fastfps_from_client);
+            return;
+        }
+    }
+    
     // 接收匹配的FastFp列表
     int match_count = 0;
     if (recv_all(client_socket, &match_count, sizeof(int)) <= 0) {
         printf("Failed to receive match count from %s: %s\n", client_ip, strerror(errno));
         if (all_fastfps) free(all_fastfps);
+        if (current_file_fastfps_from_client) free(current_file_fastfps_from_client);
         return;
     }
     

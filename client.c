@@ -135,8 +135,14 @@ int recv_all(int socket, void *buffer, size_t length) {
     
     while (received < length) {
         int result = recv(socket, buf + received, length - received, 0);
-        if (result <= 0) {
-            return result;
+        if (result < 0) {
+            perror("recv_all error");
+            return -1;
+        }
+        if (result == 0) {
+            // 连接已关闭
+            printf("Connection closed by peer, received %zu/%zu bytes\n", received, length);
+            return -1;
         }
         received += result;
     }
@@ -203,13 +209,28 @@ void send_file_data(int sock, const char* filename) {
         return;
     }
     
+    // 先计算文件大小
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    // 发送文件大小
+    if (send_all(sock, &file_size, sizeof(long)) <= 0) {
+        printf("Failed to send file size\n");
+        fclose(file);
+        return;
+    }
+    
+    // 发送文件内容
     unsigned char buffer[4096];
     size_t bytes_read;
+    long total_sent = 0;
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         if (send_all(sock, buffer, bytes_read) <= 0) {
             printf("Failed to send file content\n");
             break;
         }
+        total_sent += bytes_read;
     }
     
     fclose(file);
@@ -282,7 +303,7 @@ int receive_sha1_hashes(int sock, unsigned char *sha1_hashes, int chunk_count) {
 
 // 发送新块到服务器
 void send_new_chunks(int server_sock, unsigned char *fileCache, 
-                     int *boundary, uint64_t *local_fastfps, FastFpData *upload_fastfps, 
+                     int *boundary, uint64_t *local_fastfps, int chunk_num, FastFpData *upload_fastfps, 
                      int upload_count) {
     if (send_all(server_sock, &upload_count, sizeof(int)) <= 0) {
         printf("Failed to send upload count\n");
@@ -294,16 +315,19 @@ void send_new_chunks(int server_sock, unsigned char *fileCache,
     for (int i = 0; i < upload_count; i++) {
         uint64_t fastfp = upload_fastfps[i].fastfp;
         
-        // 在本地FastFp数组中找到对应索引
+        // 在本地FastFp数组中找到对应索引（应在所有块中查找）
         int chunk_idx = -1;
-        for (int j = 0; j < upload_count; j++) {
+        for (int j = 0; j < chunk_num; j++) {
             if (local_fastfps[j] == fastfp) {
                 chunk_idx = j;
                 break;
             }
         }
         
-        if (chunk_idx == -1) continue;
+        if (chunk_idx == -1) {
+            printf("Warning: could not locate chunk for FastFp 0x%016lx in local list\n", fastfp);
+            continue;
+        }
         
         int calc_offset = 0;
         for (int j = 0; j < chunk_idx; j++) {
@@ -512,6 +536,26 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
            server1_match_count, server2_match_count);
     
     // 向服务器发送匹配的FastFp列表
+    // 先向两个服务器发送当前文件的所有 FastFp（用于服务端清理旧块）
+    printf("Sending current file FastFp list to server1...\n");
+    if (send_all(server1_sock, &chunk_num, sizeof(int)) <= 0) {
+        printf("Failed to send chunk count to server1\n");
+    } else if (chunk_num > 0) {
+        if (send_all(server1_sock, local_fastfps, chunk_num * sizeof(uint64_t)) <= 0) {
+            printf("Failed to send FastFp list to server1\n");
+        }
+    }
+    
+    printf("Sending current file FastFp list to server2...\n");
+    if (send_all(server2_sock, &chunk_num, sizeof(int)) <= 0) {
+        printf("Failed to send chunk count to server2\n");
+    } else if (chunk_num > 0) {
+        if (send_all(server2_sock, local_fastfps, chunk_num * sizeof(uint64_t)) <= 0) {
+            printf("Failed to send FastFp list to server2\n");
+        }
+    }
+    
+    // 再发送匹配的 FastFp 列表
     printf("Sending matching FastFp list to server1...\n");
     send_matching_fastfps(server1_sock, server1_matching_fastfps, server1_match_count);
     
@@ -523,6 +567,9 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
     int server2_actual_matches = 0;
     unsigned char *server1_sha1_hashes = NULL;
     unsigned char *server2_sha1_hashes = NULL;
+    // 标记通过SHA1验证的块，用于冗余率统计
+    int *server1_verified = calloc(chunk_num, sizeof(int));
+    int *server2_verified = calloc(chunk_num, sizeof(int));
     
     if (server1_match_count > 0) {
         server1_sha1_hashes = malloc(server1_match_count * SHA_DIGEST_LENGTH);
@@ -559,12 +606,24 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
                         
                         if (match) {
                             server1_actual_matches++;
+                            if (server1_verified && chunk_idx >= 0 && chunk_idx < chunk_num) {
+                                server1_verified[chunk_idx] = 1;
+                            }
                         }
                     }
                 }
             } else {
                 printf("Failed to receive SHA1 hashes from server1, assuming all matches are valid\n");
+                // 将所有匹配块标记为已验证
                 server1_actual_matches = server1_match_count;
+                for (int i = 0; i < server1_match_count; i++) {
+                    uint64_t current_fastfp = server1_matching_fastfps[i].fastfp;
+                    int chunk_idx = -1;
+                    for (int j = 0; j < chunk_num; j++) {
+                        if (local_fastfps[j] == current_fastfp) { chunk_idx = j; break; }
+                    }
+                    if (chunk_idx != -1 && server1_verified) server1_verified[chunk_idx] = 1;
+                }
             }
         } else {
             printf("Memory allocation failed for server1 SHA1 hashes\n");
@@ -606,12 +665,24 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
                         
                         if (match) {
                             server2_actual_matches++;
+                            if (server2_verified && chunk_idx >= 0 && chunk_idx < chunk_num) {
+                                server2_verified[chunk_idx] = 1;
+                            }
                         }
                     }
                 }
             } else {
                 printf("Failed to receive SHA1 hashes from server2, assuming all matches are valid\n");
+                // 将所有匹配块标记为已验证
                 server2_actual_matches = server2_match_count;
+                for (int i = 0; i < server2_match_count; i++) {
+                    uint64_t current_fastfp = server2_matching_fastfps[i].fastfp;
+                    int chunk_idx = -1;
+                    for (int j = 0; j < chunk_num; j++) {
+                        if (local_fastfps[j] == current_fastfp) { chunk_idx = j; break; }
+                    }
+                    if (chunk_idx != -1 && server2_verified) server2_verified[chunk_idx] = 1;
+                }
             }
         } else {
             printf("Memory allocation failed for server2 SHA1 hashes\n");
@@ -664,10 +735,40 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
            server1_upload_count, server2_upload_count);
     
     // 发送需要上传的块到对应的服务器
-    send_new_chunks(server1_sock, fileCache, boundary, local_fastfps, 
+    send_new_chunks(server1_sock, fileCache, boundary, local_fastfps, chunk_num,
                     server1_upload_fastfps, server1_upload_count);
-    send_new_chunks(server2_sock, fileCache, boundary, local_fastfps, 
+    send_new_chunks(server2_sock, fileCache, boundary, local_fastfps, chunk_num,
                     server2_upload_fastfps, server2_upload_count);
+    
+    // 计算冗余率指标
+    long server1_verified_size = 0;
+    long server2_verified_size = 0;
+    long total_verified_size = 0;
+    for (int i = 0; i < chunk_num; i++) {
+        if (server1_verified && server1_verified[i]) server1_verified_size += boundary[i];
+        if (server2_verified && server2_verified[i]) server2_verified_size += boundary[i];
+    }
+    total_verified_size = server1_verified_size + server2_verified_size;
+    double total_redundancy_rate = (fileSize > 0) ? (total_verified_size * 100.0 / fileSize) : 0.0;
+    double server1_redundancy_rate = (fileSize > 0) ? (server1_verified_size * 100.0 / fileSize) : 0.0;
+    double server2_redundancy_rate = (fileSize > 0) ? (server2_verified_size * 100.0 / fileSize) : 0.0;
+    
+    printf("\n========== 冗余率统计 ==========\n");
+    printf("文件总大小: %zu bytes\n", fileSize);
+    printf("总块数: %d\n", chunk_num);
+    printf("\n验证统计:\n");
+    printf("  Server1 验证块数: %d, 验证数据量: %ld bytes\n", server1_actual_matches, server1_verified_size);
+    printf("  Server2 验证块数: %d, 验证数据量: %ld bytes\n", server2_actual_matches, server2_verified_size);
+    printf("  总验证数据量: %ld bytes\n", total_verified_size);
+    printf("\n冗余率指标:\n");
+    printf("  Server1 冗余率: %.2f%%\n", server1_redundancy_rate);
+    printf("  Server2 冗余率: %.2f%%\n", server2_redundancy_rate);
+    printf("  总冗余率: %.2f%%\n", total_redundancy_rate);
+    printf("\n上传统计:\n");
+    printf("  需要上传块数: %d\n", server1_upload_count + server2_upload_count);
+    printf("  Server1 上传块数: %d\n", server1_upload_count);
+    printf("  Server2 上传块数: %d\n", server2_upload_count);
+    printf("================================\n\n");
     
     printf("Client processed %d chunks, server1 matched %d, server2 matched %d\n", 
            chunk_num, server1_actual_matches, server2_actual_matches);

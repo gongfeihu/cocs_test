@@ -1,0 +1,35 @@
+Starting distributed FastCDC client for file: random.txt
+Connected to both servers successfully
+Sending file info to servers...
+Receiving FastFp lists from servers...
+Failed to receive FastFp list size
+Failed to receive FastFp list size
+Received FastFp lists from servers:
+Server1: 0 entries
+Server2: 0 entries
+Local file chunked into 10 pieces
+Local FastFp values:
+  Chunk 0: FastFp=0x8f1b04b258845d85, Size=8321
+  Chunk 1: FastFp=0x4d95202be80404b9, Size=10825
+  Chunk 2: FastFp=0x10f6264528acdf6e, Size=8253
+  Chunk 3: FastFp=0xbf8e22a18c049f8a, Size=13819
+  Chunk 4: FastFp=0xa4720680e4287be6, Size=12586
+  Chunk 5: FastFp=0xba0b0606b80cc5d7, Size=10228
+  Chunk 6: FastFp=0xcc3206c33404a00f, Size=8854
+  Chunk 7: FastFp=0xc19a204dd8805cfb, Size=15622
+  Chunk 8: FastFp=0x1f0322eacca860b5, Size=8846
+  Chunk 9: FastFp=0x519da59a23b23463, Size=5046
+Found 0 matches with server1 and 0 matches with server2
+Sending matching FastFp list to server1...
+Sending matching FastFp list to server2...
+Uploading 5 new chunks to server1 and 5 new chunks to server2...
+Sending 5 chunks to server
+Sent chunk (FastFp: 0x8f1b04b258845d85, size: 8321) to server
+Sent chunk (FastFp: 0x10f6264528acdf6e, size: 8253) to server
+Sent chunk (FastFp: 0xa4720680e4287be6, size: 12586) to server
+Sending 5 chunks to server
+Sent chunk (FastFp: 0x4d95202be80404b9, size: 10825) to server
+Sent chunk (FastFp: 0xbf8e22a18c049f8a, size: 13819) to server
+Client processed 10 chunks, server1 verified 0, server2 verified 0
+Uploaded 5 chunks to server1 and 5 chunks to server2
+Total processing time: 123.197121 seconds
