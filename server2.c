@@ -1,4 +1,4 @@
-// server2.c - 服务端2代码（明确存储路径）
+// server2.c - 服务端2代码
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,17 +9,27 @@
 #include <dirent.h>
 #include <openssl/sha.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/time.h> 
+#include <errno.h>
 
 #define PORT 8081
 #define MAX_CACHE_SIZE (100 * 1024 * 1024)
-#define STORAGE_DIR "./server2"  // 明确指定存储目录
+#define STORAGE_DIR "./server2file"
+#define TIMEOUT_SECONDS 60
+#define SERVER_ID 2
 
-// 计算 SHA1 哈希的辅助函数
+typedef struct {
+    uint64_t fastfp;
+    int server_id;  // 服务器ID (1 或 2)
+} FastFpData;
+
+// 计算 SHA1 哈希
 void calculate_sha1(const unsigned char *data, size_t len, unsigned char *sha1_hash) {
     SHA1(data, len, sha1_hash);
 }
 
-// 创建目录的辅助函数
+// 创建目录
 int create_directory_if_not_exists(const char *dir) {
     struct stat st = {0};
     if (stat(dir, &st) == -1) {
@@ -33,10 +43,14 @@ int create_directory_if_not_exists(const char *dir) {
 }
 
 // 从目录中收集所有chunk文件的FastFp
-uint64_t* get_all_fastfps_from_dir(const char* dir_path, int* count) {
+FastFpData* get_all_fastfps_from_dir(const char* dir_path, int* count) {
     DIR *d;
     struct dirent *entry;
-    uint64_t *fastfps = malloc(1000 * sizeof(uint64_t)); // 假设最多1000个chunks
+    FastFpData *fastfps = malloc(1000 * sizeof(FastFpData));
+    if (!fastfps) {
+        *count = 0;
+        return NULL;
+    }
     *count = 0;
     
     d = opendir(dir_path);
@@ -44,11 +58,19 @@ uint64_t* get_all_fastfps_from_dir(const char* dir_path, int* count) {
         while ((entry = readdir(d)) != NULL) {
             if (strstr(entry->d_name, ".chunk") != NULL) {
                 uint64_t fastfp;
-                if (sscanf(entry->d_name, "%16lx.chunk", &fastfp) == 1) {
-                    fastfps[*count] = fastfp;
+                if (sscanf(entry->d_name, "%016lx.chunk", &fastfp) == 1) {
+                    fastfps[*count].fastfp = fastfp;
+                    fastfps[*count].server_id = SERVER_ID;  // 设置服务器ID
                     (*count)++;
-                    if (*count >= 1000) { // 扩展空间
-                        fastfps = realloc(fastfps, (*count + 1000) * sizeof(uint64_t));
+                    if (*count >= 1000) {
+                        FastFpData *temp = realloc(fastfps, (*count + 1000) * sizeof(FastFpData));
+                        if (temp == NULL) {
+                            closedir(d);
+                            free(fastfps);
+                            *count = 0;
+                            return NULL;
+                        }
+                        fastfps = temp;
                     }
                 }
             }
@@ -59,161 +81,384 @@ uint64_t* get_all_fastfps_from_dir(const char* dir_path, int* count) {
     return fastfps;
 }
 
+// 确保所有数据都发送完成
+int send_all(int socket, const void *buffer, size_t length) {
+    const char *buf = (const char *)buffer;
+    size_t sent = 0;
+    
+    while (sent < length) {
+        int result = send(socket, buf + sent, length - sent, 0);
+        if (result <= 0) {
+            return result;
+        }
+        sent += result;
+    }
+    return sent;
+}
+
+// 确保所有数据都接收完成
+int recv_all(int socket, void *buffer, size_t length) {
+    char *buf = (char *)buffer;
+    size_t received = 0;
+    
+    while (received < length) {
+        int result = recv(socket, buf + received, length - received, 0);
+        if (result <= 0) {
+            return result;
+        }
+        received += result;
+    }
+    return received;
+}
+
+// 检查FastFp是否存在于本地存储中
+int fastfp_exists_locally(uint64_t fastfp) {
+    char chunk_path[512];
+    snprintf(chunk_path, sizeof(chunk_path), "%s/%016lx.chunk", STORAGE_DIR, fastfp);
+    
+    FILE *file = fopen(chunk_path, "rb");
+    if (file) {
+        fclose(file);
+        return 1;
+    }
+    return 0;
+}
+
+// 删除目录中不在当前文件分块列表中的chunk文件
+void cleanup_chunks_not_in_list(const char* dir_path, uint64_t *current_fastfps, int count) {
+    if (!current_fastfps || count <= 0) return;
+    
+    DIR *d;
+    struct dirent *entry;
+    
+    // 创建一个简单的哈希表来标记当前文件的FastFp
+    int *fastfp_exists = calloc(10000, sizeof(int));
+    if (!fastfp_exists) return;
+    
+    // 标记当前文件的FastFp
+    for (int i = 0; i < count; i++) {
+        int index = (current_fastfps[i] % 10000);
+        if (index < 0) index = -index;
+        fastfp_exists[index] = 1;
+    }
+    
+    d = opendir(dir_path);
+    if (d) {
+        while ((entry = readdir(d)) != NULL) {
+            if (strstr(entry->d_name, ".chunk") != NULL) {
+                uint64_t fastfp;
+                if (sscanf(entry->d_name, "%016lx.chunk", &fastfp) == 1) {
+                    int index = (fastfp % 10000);
+                    if (index < 0) index = -index;
+                    
+                    // 如果当前FastFp不在当前文件的列表中，则删除该文件
+                    if (fastfp_exists[index] == 0) {
+                        char chunk_path[512];
+                        snprintf(chunk_path, sizeof(chunk_path), "%s/%s", dir_path, entry->d_name);
+                        if (remove(chunk_path) == 0) {
+                            printf("Deleted old chunk file: %s\n", chunk_path);
+                        } else {
+                            printf("Failed to delete old chunk file: %s\n", chunk_path);
+                        }
+                    }
+                }
+            }
+        }
+        closedir(d);
+    }
+    
+    free(fastfp_exists);
+}
+
 // 处理客户端连接
 void handle_client(int client_socket, struct sockaddr_in *client_addr) {
-    // 获取客户端IP地址
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr->sin_addr), client_ip, INET_ADDRSTRLEN);
     printf("Handling client connection from %s\n", client_ip);
     
-    // 创建存储目录
+    // 确保目录存在
     create_directory_if_not_exists(STORAGE_DIR);
     
     // 接收文件名
     int name_len;
-    if (recv(client_socket, &name_len, sizeof(int), 0) <= 0) {
-        printf("Failed to receive filename length\n");
+    if (recv_all(client_socket, &name_len, sizeof(int)) <= 0) {
+        printf("Failed to receive filename length from %s: %s\n", client_ip, strerror(errno));
+        return;
+    }
+    
+    if (name_len <= 0 || name_len > 255) {
+        printf("Invalid filename length: %d\n", name_len);
         return;
     }
     
     char filename[name_len + 1];
-    if (recv(client_socket, filename, name_len, 0) <= 0) {
-        printf("Failed to receive filename\n");
+    if (recv_all(client_socket, filename, name_len) <= 0) {
+        printf("Failed to receive filename from %s: %s\n", client_ip, strerror(errno));
         return;
     }
     filename[name_len] = '\0';
     
     printf("Received file: %s from client %s\n", filename, client_ip);
     
-    // 读取文件内容（虽然不需要，但为了同步）
-    unsigned char temp_buffer[4096];
-    int bytes_read;
-    do {
-        bytes_read = recv(client_socket, temp_buffer, sizeof(temp_buffer), 0);
-        if (bytes_read < 0) {
-            printf("Error receiving file content\n");
-            return;
-        }
-    } while (bytes_read > 0);
+    // 丢弃文件内容
+    unsigned char buffer[4096];
+    size_t total_size = 0;
+    ssize_t bytes_read;
+    while ((bytes_read = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
+        total_size += bytes_read;
+    }
     
     // 收集当前目录中的所有FastFp
-    int fastfp_count;
-    uint64_t *all_fastfps = get_all_fastfps_from_dir(STORAGE_DIR, &fastfp_count);
+    int fastfp_count = 0;
+    FastFpData *all_fastfps = get_all_fastfps_from_dir(STORAGE_DIR, &fastfp_count);
     
-    // 发送FastFp列表给客户端
-    send(client_socket, &fastfp_count, sizeof(int), 0);
-    if (fastfp_count > 0) {
-        send(client_socket, all_fastfps, fastfp_count * sizeof(uint64_t), 0);
-    }
+    printf("Found %d existing chunks in %s directory\n", fastfp_count, STORAGE_DIR);
     
-    printf("Sent %d FastFp values to client %s\n", fastfp_count, client_ip);
-    
-    // 接收匹配的FastFp列表
-    int match_count;
-    if (recv(client_socket, &match_count, sizeof(int), 0) <= 0) {
-        printf("Failed to receive match count\n");
-        free(all_fastfps);
+    // 发送FastFp列表给客户端（包含服务器ID）
+    if (send_all(client_socket, &fastfp_count, sizeof(int)) <= 0) {
+        printf("Failed to send FastFp count to %s: %s\n", client_ip, strerror(errno));
+        if (all_fastfps) free(all_fastfps);
         return;
     }
-    
-    uint64_t *matching_fastfps = NULL;
-    if (match_count > 0) {
-        matching_fastfps = malloc(match_count * sizeof(uint64_t));
-        if (recv(client_socket, matching_fastfps, match_count * sizeof(uint64_t), 0) <= 0) {
-            printf("Failed to receive matching FastFp list\n");
+    if (fastfp_count > 0) {
+        if (send_all(client_socket, all_fastfps, fastfp_count * sizeof(FastFpData)) <= 0) {
+            printf("Failed to send FastFp list to %s: %s\n", client_ip, strerror(errno));
             free(all_fastfps);
             return;
         }
+        printf("Sent %d FastFp values to client %s\n", fastfp_count, client_ip);
+    } else {
+        printf("No existing chunks in directory, sent 0 count to client %s\n", client_ip);
     }
     
-    // 为匹配的FastFp计算SHA1哈希
-    unsigned char *sha1_hashes = malloc(match_count * SHA_DIGEST_LENGTH);
-    for (int i = 0; i < match_count; i++) {
-        char chunk_path[512];
-        snprintf(chunk_path, sizeof(chunk_path), "%s/%016lx.chunk", STORAGE_DIR, matching_fastfps[i]);
-        
-        FILE *chunk_file = fopen(chunk_path, "rb");
-        if (chunk_file) {
-            fseek(chunk_file, 0, SEEK_END);
-            long size = ftell(chunk_file);
-            fseek(chunk_file, 0, SEEK_SET);
-            
-            unsigned char *chunk_data = malloc(size);
-            fread(chunk_data, 1, size, chunk_file);
-            
-            calculate_sha1(chunk_data, size, sha1_hashes + i * SHA_DIGEST_LENGTH);
-            
-            free(chunk_data);
-            fclose(chunk_file);
-            printf("Calculated SHA1 for existing chunk 0x%016lx\n", matching_fastfps[i]);
-        } else {
-            // 如果找不到文件，生成空的SHA1
-            memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
-            printf("Chunk 0x%016lx not found, sending empty SHA1\n", matching_fastfps[i]);
+    // 接收匹配的FastFp列表
+    int match_count = 0;
+    if (recv_all(client_socket, &match_count, sizeof(int)) <= 0) {
+        printf("Failed to receive match count from %s: %s\n", client_ip, strerror(errno));
+        if (all_fastfps) free(all_fastfps);
+        return;
+    }
+    
+    if (match_count < 0 || match_count > 10000) {
+        printf("Invalid match count received: %d\n", match_count);
+        if (all_fastfps) free(all_fastfps);
+        return;
+    }
+    
+    printf("Client reported %d matching FastFps\n", match_count);
+    
+    FastFpData *matching_fastfps = NULL;
+    if (match_count > 0) {
+        matching_fastfps = malloc(match_count * sizeof(FastFpData));
+        if (!matching_fastfps) {
+            printf("Memory allocation failed for matching FastFps\n");
+            if (all_fastfps) free(all_fastfps);
+            return;
         }
+        if (recv_all(client_socket, matching_fastfps, match_count * sizeof(FastFpData)) <= 0) {
+            printf("Failed to receive matching FastFp list from %s: %s\n", client_ip, strerror(errno));
+            free(all_fastfps);
+            free(matching_fastfps);
+            return;
+        }
+        
+        // 为匹配的FastFp计算SHA1哈希
+        unsigned char *sha1_hashes = malloc(match_count * SHA_DIGEST_LENGTH);
+        if (!sha1_hashes) {
+            printf("Memory allocation failed for SHA1 hashes\n");
+            free(all_fastfps);
+            free(matching_fastfps);
+            return;
+        }
+        
+        for (int i = 0; i < match_count; i++) {
+            if (fastfp_exists_locally(matching_fastfps[i].fastfp)) {
+                char chunk_path[512];
+                snprintf(chunk_path, sizeof(chunk_path), "%s/%016lx.chunk", STORAGE_DIR, matching_fastfps[i].fastfp);
+                
+                FILE *chunk_file = fopen(chunk_path, "rb");
+                if (chunk_file) {
+                    fseek(chunk_file, 0, SEEK_END);
+                    long size = ftell(chunk_file);
+                    if (size > 0) {
+                        fseek(chunk_file, 0, SEEK_SET);
+                        
+                        unsigned char *chunk_data = malloc(size);
+                        if (chunk_data) {
+                            if (fread(chunk_data, 1, size, chunk_file) == size) {
+                                calculate_sha1(chunk_data, size, sha1_hashes + i * SHA_DIGEST_LENGTH);
+                                printf("Calculated SHA1 for existing chunk 0x%016lx\n", matching_fastfps[i].fastfp);
+                            } else {
+                                memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
+                                printf("Failed to read chunk 0x%016lx, sending empty SHA1\n", matching_fastfps[i].fastfp);
+                            }
+                            free(chunk_data);
+                        } else {
+                            memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
+                            printf("Memory allocation failed for chunk 0x%016lx, sending empty SHA1\n", matching_fastfps[i].fastfp);
+                        }
+                    } else {
+                        memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
+                        printf("Chunk 0x%016lx is empty, sending empty SHA1\n", matching_fastfps[i].fastfp);
+                    }
+                    fclose(chunk_file);
+                } else {
+                    memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
+                    printf("Chunk 0x%016lx not found, sending empty SHA1\n", matching_fastfps[i].fastfp);
+                }
+            } else {
+                memset(sha1_hashes + i * SHA_DIGEST_LENGTH, 0, SHA_DIGEST_LENGTH);
+                printf("Chunk 0x%016lx not found locally, sending empty SHA1\n", matching_fastfps[i].fastfp);
+            }
+        }
+        
+        // 发送SHA1哈希给客户端
+        if (send_all(client_socket, sha1_hashes, match_count * SHA_DIGEST_LENGTH) <= 0) {
+            printf("Failed to send SHA1 hashes to %s: %s\n", client_ip, strerror(errno));
+            free(all_fastfps);
+            free(matching_fastfps);
+            free(sha1_hashes);
+            return;
+        }
+        
+        free(sha1_hashes);
+    } else {
+        printf("No matching FastFps to verify, skipping SHA1 calculation\n");
     }
-    
-    // 发送SHA1哈希给客户端（第一个是模拟server1的，第二个是自己的）
-    send(client_socket, sha1_hashes, match_count * SHA_DIGEST_LENGTH, 0); // 模拟server1的哈希
-    send(client_socket, sha1_hashes, match_count * SHA_DIGEST_LENGTH, 0); // 自己的哈希
     
     // 接收需要上传的新块
-    int upload_count;
-    if (recv(client_socket, &upload_count, sizeof(int), 0) <= 0) {
-        printf("Failed to receive upload count\n");
-        free(all_fastfps);
-        free(matching_fastfps);
-        free(sha1_hashes);
+    int upload_count = 0;
+    if (recv_all(client_socket, &upload_count, sizeof(int)) <= 0) {
+        printf("Failed to receive upload count from %s: %s\n", client_ip, strerror(errno));
+        if (all_fastfps) free(all_fastfps);
+        if (matching_fastfps) free(matching_fastfps);
+        return;
+    }
+    
+    if (upload_count < 0 || upload_count > 10000) {
+        printf("Invalid upload count received: %d\n", upload_count);
+        if (all_fastfps) free(all_fastfps);
+        if (matching_fastfps) free(matching_fastfps);
         return;
     }
     
     printf("Receiving %d new chunks from client %s\n", upload_count, client_ip);
     
-    for (int i = 0; i < upload_count; i++) {
-        // 接收FastFp
-        uint64_t fastfp;
-        if (recv(client_socket, &fastfp, sizeof(uint64_t), 0) <= 0) {
-            printf("Failed to receive FastFp\n");
-            break;
-        }
-        
-        // 接收块大小
-        int chunk_size;
-        if (recv(client_socket, &chunk_size, sizeof(int), 0) <= 0) {
-            printf("Failed to receive chunk size\n");
-            break;
-        }
-        
-        // 接收块数据
-        unsigned char *chunk_data = malloc(chunk_size);
-        if (recv(client_socket, chunk_data, chunk_size, 0) <= 0) {
-            printf("Failed to receive chunk data\n");
-            free(chunk_data);
-            break;
-        }
-        
-        // 保存到文件
-        char chunk_filename[256];
-        snprintf(chunk_filename, sizeof(chunk_filename), "%s/%016lx.chunk", STORAGE_DIR, fastfp);
-        
-        FILE *out_file = fopen(chunk_filename, "wb");
-        if (out_file) {
-            fwrite(chunk_data, 1, chunk_size, out_file);
-            fclose(out_file);
-            printf("Saved chunk to %s (size: %d) from client %s\n", chunk_filename, chunk_size, client_ip);
+    // 保存当前文件的FastFp列表，用于后续清理
+    uint64_t *current_file_fastfps = NULL;
+    int current_fastfp_count = 0;
+    int error_occurred = 0;
+    
+    // 先添加匹配的FastFp
+    if (match_count > 0 && matching_fastfps) {
+        current_file_fastfps = malloc((upload_count + match_count) * sizeof(uint64_t));
+        if (!current_file_fastfps) {
+            printf("Memory allocation failed for current file FastFps\n");
+            error_occurred = 1;
         } else {
-            printf("Failed to save chunk to %s\n", chunk_filename);
+            for (int i = 0; i < match_count; i++) {
+                current_file_fastfps[current_fastfp_count++] = matching_fastfps[i].fastfp;
+            }
         }
-        
-        free(chunk_data);
+    }
+    
+    if (!error_occurred) {
+        for (int i = 0; i < upload_count; i++) {
+            // 接收FastFp
+            uint64_t fastfp;
+            if (recv_all(client_socket, &fastfp, sizeof(uint64_t)) <= 0) {
+                printf("Failed to receive FastFp from %s: %s\n", client_ip, strerror(errno));
+                error_occurred = 1;
+                break;
+            }
+            
+            // 接收块大小
+            int chunk_size;
+            if (recv_all(client_socket, &chunk_size, sizeof(int)) <= 0) {
+                printf("Failed to receive chunk size from %s: %s\n", client_ip, strerror(errno));
+                error_occurred = 1;
+                break;
+            }
+            
+            if (chunk_size <= 0 || chunk_size > MAX_CACHE_SIZE) {
+                printf("Invalid chunk size received: %d\n", chunk_size);
+                error_occurred = 1;
+                break;
+            }
+            
+            // 接收块数据
+            unsigned char *chunk_data = malloc(chunk_size);
+            if (!chunk_data) {
+                printf("Memory allocation failed for chunk data\n");
+                error_occurred = 1;
+                break;
+            }
+            
+            int total_received = 0;
+            int chunk_error = 0;
+            while (total_received < chunk_size) {
+                int bytes_to_receive = (chunk_size - total_received > 4096) ? 4096 : (chunk_size - total_received);
+                int bytes_received = recv(client_socket, chunk_data + total_received, bytes_to_receive, 0);
+                if (bytes_received <= 0) {
+                    printf("Failed to receive chunk data from %s: %s\n", client_ip, strerror(errno));
+                    free(chunk_data);
+                    chunk_error = 1;
+                    error_occurred = 1;
+                    break;
+                }
+                total_received += bytes_received;
+            }
+            
+            if (chunk_error) {
+                break;
+            }
+            
+            if (total_received != chunk_size) {
+                printf("Incomplete chunk data received from %s\n", client_ip);
+                free(chunk_data);
+                error_occurred = 1;
+                break;
+            }
+            
+            // 保存到文件
+            char chunk_filename[256];
+            snprintf(chunk_filename, sizeof(chunk_filename), "%s/%016lx.chunk", STORAGE_DIR, fastfp);
+            
+            FILE *out_file = fopen(chunk_filename, "wb");
+            if (out_file) {
+                if (fwrite(chunk_data, 1, chunk_size, out_file) == chunk_size) {
+                    printf("Saved chunk to %s (size: %d) from client %s\n", chunk_filename, chunk_size, client_ip);
+                } else {
+                    printf("Failed to write chunk to %s\n", chunk_filename);
+                }
+                fclose(out_file);
+            } else {
+                printf("Failed to save chunk to %s\n", chunk_filename);
+            }
+            
+            // 添加到当前文件的FastFp列表
+            if (current_file_fastfps) {
+                current_file_fastfps[current_fastfp_count++] = fastfp;
+            }
+            
+            free(chunk_data);
+        }
+    }
+    
+    // 只有在没有发生错误且有当前文件的FastFp列表时才执行清理
+    if (!error_occurred && current_file_fastfps && current_fastfp_count > 0) {
+        printf("Cleaning up chunks not in current file...\n");
+        cleanup_chunks_not_in_list(STORAGE_DIR, current_file_fastfps, current_fastfp_count);
+    } else if (error_occurred) {
+        printf("Error occurred during processing, skipping cleanup\n");
     }
     
     // 清理资源
     if (all_fastfps) free(all_fastfps);
     if (matching_fastfps) free(matching_fastfps);
-    if (sha1_hashes) free(sha1_hashes);
+    if (current_file_fastfps) free(current_file_fastfps);
     
-    printf("Finished handling client %s on server2\n", client_ip);
+    printf("Finished handling client %s on server%d\n", client_ip, SERVER_ID);
 }
 
 int main(int argc, char *argv[]) {
@@ -222,21 +467,21 @@ int main(int argc, char *argv[]) {
     int opt = 1;
     int addrlen = sizeof(address);
     
-    // 允许通过命令行参数指定端口
     int port = PORT;
     if (argc > 1) {
         port = atoi(argv[1]);
     }
     
-    printf("Starting server2 on port %d\n", port);
+    printf("Starting server%d on port %d\n", SERVER_ID, port);
     
-    // 创建socket
+    // 确保目录存在
+    create_directory_if_not_exists(STORAGE_DIR);
+    
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
     
-    // 设置socket选项 - 移除SO_REUSEPORT
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
@@ -246,19 +491,17 @@ int main(int argc, char *argv[]) {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
     
-    // 绑定
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
     
-    // 监听
     if (listen(server_fd, 3) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
     }
     
-    printf("Server2 listening on port %d, storing chunks in %s/\n", port, STORAGE_DIR);
+    printf("Server%d listening on port %d, storing chunks in %s/\n", SERVER_ID, port, STORAGE_DIR);
     
     while(1) {
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
