@@ -613,17 +613,8 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
                     }
                 }
             } else {
-                printf("Failed to receive SHA1 hashes from server1, assuming all matches are valid\n");
-                // 将所有匹配块标记为已验证
-                server1_actual_matches = server1_match_count;
-                for (int i = 0; i < server1_match_count; i++) {
-                    uint64_t current_fastfp = server1_matching_fastfps[i].fastfp;
-                    int chunk_idx = -1;
-                    for (int j = 0; j < chunk_num; j++) {
-                        if (local_fastfps[j] == current_fastfp) { chunk_idx = j; break; }
-                    }
-                    if (chunk_idx != -1 && server1_verified) server1_verified[chunk_idx] = 1;
-                }
+                printf("Failed to receive SHA1 hashes from server1, treat matches as unverified and re-upload if needed\n");
+                // 不标记为已验证，后续将按未验证处理并纳入上传
             }
         } else {
             printf("Memory allocation failed for server1 SHA1 hashes\n");
@@ -697,28 +688,15 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
     
     for (int i = 0; i < chunk_num; i++) {
         uint64_t current_fastfp = local_fastfps[i];
-        int is_server1_match = 0;
-        int is_server2_match = 0;
+        int verified_any = 0;
+        if (server1_verified && server1_verified[i]) verified_any = 1;
+        if (server2_verified && server2_verified[i]) verified_any = 1;
         
-        for (int j = 0; j < server1_match_count; j++) {
-            if (server1_matching_fastfps[j].fastfp == current_fastfp) {
-                is_server1_match = 1;
-                break;
-            }
-        }
-        
-        for (int j = 0; j < server2_match_count; j++) {
-            if (server2_matching_fastfps[j].fastfp == current_fastfp) {
-                is_server2_match = 1;
-                break;
-            }
-        }
-        
-        if (is_server1_match || is_server2_match) {
-            // 已经匹配，不需要上传
+        if (verified_any) {
+            // 已通过任一服务器的 SHA1 验证，视为可复用，不上传
             continue;
         } else {
-            // 不匹配任何服务器，按索引分配
+            // 未通过验证（或未匹配），按索引分配上传目标服务器
             if (i % 2 == 0) {
                 server1_upload_fastfps[server1_upload_count].fastfp = current_fastfp;
                 server1_upload_fastfps[server1_upload_count].server_id = SERVER1_ID;
@@ -740,15 +718,17 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
     send_new_chunks(server2_sock, fileCache, boundary, local_fastfps, chunk_num,
                     server2_upload_fastfps, server2_upload_count);
     
-    // 计算冗余率指标
+    // 计算冗余率指标（注意：总冗余率按“并集”计算，避免双计）
     long server1_verified_size = 0;
     long server2_verified_size = 0;
     long total_verified_size = 0;
     for (int i = 0; i < chunk_num; i++) {
         if (server1_verified && server1_verified[i]) server1_verified_size += boundary[i];
         if (server2_verified && server2_verified[i]) server2_verified_size += boundary[i];
+        if ((server1_verified && server1_verified[i]) || (server2_verified && server2_verified[i])) {
+            total_verified_size += boundary[i];
+        }
     }
-    total_verified_size = server1_verified_size + server2_verified_size;
     double total_redundancy_rate = (fileSize > 0) ? (total_verified_size * 100.0 / fileSize) : 0.0;
     double server1_redundancy_rate = (fileSize > 0) ? (server1_verified_size * 100.0 / fileSize) : 0.0;
     double server2_redundancy_rate = (fileSize > 0) ? (server2_verified_size * 100.0 / fileSize) : 0.0;
@@ -797,32 +777,42 @@ int process_file_on_client(const char* filename, const char* server1_ip, int ser
 }
 
 void print_usage(const char* program_name) {
-    printf("Usage: %s <filename>\n", program_name);
-    printf("Example: %s myfile.txt\n", program_name);
-    printf("Default server1: 127.0.0.1:8080, server2: 127.0.0.1:8080\n");
+    printf("Usage:\n");
+    printf("  %s <filename>\n", program_name);
+    printf("  %s <old_file> <new_file>  # 先用 old_file 预置服务端，再对 new_file 计算冗余率\n", program_name);
+    printf("Example: %s random.txt random_copy.txt\n", program_name);
+    printf("Default server1: 127.0.0.1:%d, server2: 127.0.0.1:%d\n", DEFAULT_SERVER_PORT, DEFAULT_SERVER_PORT1);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return -1;
-    }
-    
-    const char* filename = argv[1];
     const char* server1_ip = "127.0.0.1";
     const char* server2_ip = "127.0.0.1";
     int server1_port = DEFAULT_SERVER_PORT;
     int server2_port = DEFAULT_SERVER_PORT1;
-    
-    struct timeval start, end;
-    gettimeofday(&start, NULL);
-    
-    int result = process_file_on_client(filename, server1_ip, server1_port, 
-                                       server2_ip, server2_port);
-    
-    gettimeofday(&end, NULL);
-    double total_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
-    printf("Total processing time: %.6f seconds\n", total_time);
-    
-    return result;
+
+    if (argc == 2) {
+        const char* filename = argv[1];
+        struct timeval start, end; gettimeofday(&start, NULL);
+        int result = process_file_on_client(filename, server1_ip, server1_port,
+                                            server2_ip, server2_port);
+        gettimeofday(&end, NULL);
+        double total_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
+        printf("Total processing time: %.6f seconds\n", total_time);
+        return result;
+    } else if (argc == 3) {
+        // 配对模式：先用旧文件铺底，再用新文件计算冗余率（保证对称的基线）
+        const char* old_file = argv[1];
+        const char* new_file = argv[2];
+
+        printf("[Pair Mode] Seeding servers with old file: %s\n", old_file);
+        if (process_file_on_client(old_file, server1_ip, server1_port, server2_ip, server2_port) != 0) {
+            printf("Seeding failed\n");
+            return -1;
+        }
+        printf("[Pair Mode] Computing redundancy for new file: %s\n", new_file);
+        return process_file_on_client(new_file, server1_ip, server1_port, server2_ip, server2_port);
+    } else {
+        print_usage(argv[0]);
+        return -1;
+    }
 }
