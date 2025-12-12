@@ -785,8 +785,8 @@ void print_usage(const char* program_name) {
 }
 
 int main(int argc, char *argv[]) {
-    const char* server1_ip = "127.0.0.1";
-    const char* server2_ip = "127.0.0.1";
+    const char* server1_ip = "10.26.57.57";
+    const char* server2_ip = "10.26.57.56";
     int server1_port = DEFAULT_SERVER_PORT;
     int server2_port = DEFAULT_SERVER_PORT1;
 
