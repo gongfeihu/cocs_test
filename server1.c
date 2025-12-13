@@ -13,7 +13,7 @@
 #include <sys/time.h> 
 #include <errno.h>
 
-#define PORT 8082
+#define PORT 8081
 #define MAX_CACHE_SIZE (100 * 1024 * 1024)
 #define STORAGE_DIR "./server1file"
 #define TIMEOUT_SECONDS 60
